@@ -1,0 +1,26 @@
+# Environment and reward of router RL (rl/router_interaction.py). Models with provider `oss`
+# are served at $OSS_OPENAI_BASE_URL; any litellm provider works for the user simulator.
+interaction:
+  - name: ares_router
+    class_name: router_interaction.RouterInteraction
+    config:
+      oss_model: openai/gpt-oss-20b
+      oss_temperature: 1.0
+      oss_max_tokens: 4096
+      user_model: gpt-4o
+      user_provider: openai
+      user_temperature: 1.0
+      user_max_tokens: 2048
+      request_timeout: 60
+      max_total_steps: 30
+      max_history_chars: 8000
+      success_reward: 5.0
+      failure_reward: 0.0
+      format_penalty: -1.0
+      penalties:
+        low: -0.2
+        medium: -0.5
+        high: -1.0
+      terminate_tools:
+        - transfer_to_human_agents
+      log_dir: outputs/router_rollouts

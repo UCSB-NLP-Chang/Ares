@@ -1,0 +1,116 @@
+# GRPO training of the ARES router with verl (see rl/train_grpo.sh).
+hydra:
+  searchpath:
+    - pkg://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+trainer:
+  project_name: ares
+  experiment_name: router_grpo
+  logger: ["console"]
+  total_epochs: 5
+  balance_batch: False
+  val_before_train: False
+  test_freq: 10
+  save_freq: 5
+  max_actor_ckpt_to_keep: 1
+  max_critic_ckpt_to_keep: 1
+  default_local_dir: outputs/router_grpo
+  nnodes: 1
+  n_gpus_per_node: 4
+
+data:
+  train_files: ???
+  val_files: ???
+  train_batch_size: 32
+  val_batch_size: 4
+  max_prompt_length: 4096
+  max_response_length: 512
+  dataloader_num_workers: 0
+  return_raw_chat: True
+  filter_overlong_prompts: False
+  shuffle: True
+
+actor_rollout_ref:
+  ref:
+    log_prob_micro_batch_size_per_gpu: 4
+  model:
+    path: ???  # SFT router checkpoint
+    trust_remote_code: False
+    override_config:
+      attn_implementation: sdpa
+  rollout:
+    name: vllm
+    load_format: auto
+    tensor_model_parallel_size: 1
+    data_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    gpu_memory_utilization: 0.3
+    max_num_batched_tokens: 4096
+    max_num_seqs: 8
+    enforce_eager: True
+    enable_prefix_caching: False
+    calculate_log_probs: True
+    log_prob_micro_batch_size_per_gpu: 1
+    prompt_length: 4096
+    response_length: 512
+    max_model_len: 8192
+    n: 16
+    temperature: 0.6
+    top_k: 20
+    top_p: 0.95
+    do_sample: True
+    val_kwargs:
+      do_sample: False
+      temperature: 1.0
+    multi_turn:
+      enable: True
+      max_assistant_turns: 24
+      max_user_turns: 24
+      interaction_config_path: config/interaction.yaml
+    custom:
+      drop_failed_samples: True  # skip episodes that raise an error instead of stopping training
+    agent:
+      num_workers: 8
+      default_agent_loop: router_agent
+      agent_loop_config_path: config/agent_loop.yaml
+      agent_loop_manager_class: router_agent_loop.RouterStepAgentLoopManager
+  actor:
+    ppo_mini_batch_size: 32
+    ppo_micro_batch_size_per_gpu: 8
+    ppo_max_token_len_per_gpu: 16384
+    ppo_epochs: 1
+    use_kl_loss: True
+    kl_loss_coef: 0.01
+    optim:
+      lr: 1.5e-06
+
+critic:
+  enable: False
+  model:
+    path: ${actor_rollout_ref.model.path}
+  ppo_mini_batch_size: 32
+  ppo_micro_batch_size_per_gpu: 8
+  ppo_max_token_len_per_gpu: 16384
+  ppo_epochs: 1
+  optim:
+    lr: 1.5e-06
+
+algorithm:
+  adv_estimator: grpo
+  rollout_correction:
+    bypass_mode: True
+
+reward_model:
+  enable: False
+
+ray_kwargs:
+  ray_init:
+    include_dashboard: False
+    runtime_env:
+      excludes:
+        - outputs/**
+        - data/**

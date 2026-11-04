@@ -1,0 +1,141 @@
+Patch for verl f98fed11a7dad95ce84aaa4607ba99c5f780dd6b (https://github.com/verl-project/verl).
+
+The router agent loop (rl/router_agent_loop.py) returns one training sample per routing step,
+so the rollout batch has an arbitrary size. This patch
+  - uses the per-step rollout batch directly when its size differs from the prompt batch,
+  - pads batches to a multiple of the data-parallel size for log-prob/value inference and
+    for actor/critic updates (padded samples have no loss),
+  - skips padding-only micro-batches in the actor update, and
+  - reduces metric lists that differ in length across ranks.
+
+diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
+index 45bf0d3..44655fa 100644
+--- a/verl/trainer/ppo/ray_trainer.py
++++ b/verl/trainer/ppo/ray_trainer.py
+@@ -1210,7 +1210,36 @@ class RayPPOTrainer:
+         )
+         metrics.update(global_balance_stats)
+ 
++    def _dp_chunked(self, fn, batch: DataProto, dp_size: int) -> DataProto:
++        """Apply `fn` to chunks of `batch`, each padded to a multiple of `dp_size`.
++
++        Agent loops that return one sample per step produce batches of arbitrary size.
++        """
++        outputs = []
++        for chunk in batch.split(self.config.trainer.get("dp_infer_chunk_size", 32)):
++            chunk, pad_size = pad_dataproto_to_divisor(chunk, dp_size)
++            outputs.append(unpad_dataproto(fn(chunk), pad_size=pad_size))
++        return DataProto.concat(outputs)
++
++    def _pad_for_update(self, batch: DataProto, dp_size: int) -> DataProto:
++        """Pad `batch` to a multiple of `dp_size` with copies of its last sample that carry no loss."""
++        pad_size = -len(batch) % dp_size
++        if pad_size == 0:
++            return batch
++        n = len(batch)
++        global_token_num = batch.meta_info.get("global_token_num")
++        batch = DataProto.concat([batch, batch.slice(n - 1, n).repeat(pad_size)])
++        for key in ("response_mask", "advantages", "returns", "values", "token_level_rewards", "token_level_scores"):
++            if key in batch.batch.keys():
++                batch.batch[key][n:] = 0
++        if global_token_num is not None:
++            batch.meta_info["global_token_num"] = list(global_token_num) + [0] * pad_size
++        return batch
++
+     def _compute_values(self, batch: DataProto) -> DataProto:
++        return self._dp_chunked(self._compute_values_single, batch, self._get_dp_size(self.critic_wg, "critic"))
++
++    def _compute_values_single(self, batch: DataProto) -> DataProto:
+         if self.use_legacy_worker_impl == "disable":
+             batch_td = batch.to_tensordict()
+             # step 2: convert from padding to nopadding
+@@ -1228,6 +1257,10 @@ class RayPPOTrainer:
+         return values
+ 
+     def _compute_ref_log_prob(self, batch: DataProto) -> DataProto:
++        worker_group = self.actor_rollout_wg if self.ref_in_actor else self.ref_policy_wg
++        return self._dp_chunked(self._compute_ref_log_prob_single, batch, self._get_dp_size(worker_group, "actor"))
++
++    def _compute_ref_log_prob_single(self, batch: DataProto) -> DataProto:
+         if self.use_legacy_worker_impl == "disable":
+             # step 1: convert dataproto to tensordict.
+             batch_td = batch.to_tensordict()
+@@ -1255,6 +1288,17 @@ class RayPPOTrainer:
+         return ref_log_prob
+ 
+     def _compute_old_log_prob(self, batch: DataProto):
++        mfu = []
++
++        def compute(chunk):
++            old_log_prob, chunk_mfu = self._compute_old_log_prob_single(chunk)
++            mfu.append(chunk_mfu)
++            return old_log_prob
++
++        old_log_prob = self._dp_chunked(compute, batch, self._get_dp_size(self.actor_rollout_wg, "actor"))
++        return old_log_prob, float(np.mean(mfu))
++
++    def _compute_old_log_prob_single(self, batch: DataProto):
+         if self.use_legacy_worker_impl == "disable":
+             # TODO: remove step 1, 2, 4 after we make the whole training tensordict and padding free
+             # step 1: convert dataproto to tensordict.
+@@ -1284,6 +1328,7 @@ class RayPPOTrainer:
+         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
+         # TODO: Make "temperature" single source of truth from generation.
+         batch.meta_info["temperature"] = rollout_config.temperature
++        batch = self._pad_for_update(batch, self._get_dp_size(self.actor_rollout_wg, "actor"))
+         # update actor
+         if self.use_legacy_worker_impl == "disable":
+             batch_td = batch.to_tensordict()
+@@ -1316,6 +1361,7 @@ class RayPPOTrainer:
+         return actor_output
+ 
+     def _update_critic(self, batch: DataProto) -> DataProto:
++        batch = self._pad_for_update(batch, self._get_dp_size(self.critic_wg, "critic"))
+         if self.use_legacy_worker_impl == "disable":
+             batch_td = batch.to_tensordict()
+             # step 2: convert from padding to no-padding
+@@ -1478,7 +1524,10 @@ class RayPPOTrainer:
+                             del rm_scores, gen_baseline_batch, gen_baseline_output
+                     # repeat to align with repeated responses in rollout
+                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+-                    batch = batch.union(gen_batch_output)
++                    if len(batch) == len(gen_batch_output):
++                        batch = batch.union(gen_batch_output)
++                    else:  # the agent loop returned one sample per step
++                        batch = gen_batch_output
+ 
+                     if "response_mask" not in batch.batch.keys():
+                         batch.batch["response_mask"] = compute_response_mask(batch)
+diff --git a/verl/utils/metric/utils.py b/verl/utils/metric/utils.py
+index 79873cf..355de24 100644
+--- a/verl/utils/metric/utils.py
++++ b/verl/utils/metric/utils.py
+@@ -49,7 +49,10 @@ def reduce_metrics(metrics: dict[str, Union["Metric", list[Any]]]) -> dict[str,
+     for key, val in metrics.items():
+         if isinstance(val, Metric):
+             metrics[key] = val.aggregate()
+-        elif "max" in key:
++            continue
++        if isinstance(val, list):  # per-rank lists may be ragged
++            val = [x for v in val for x in (v if isinstance(v, list) else [v])]
++        if "max" in key:
+             metrics[key] = np.max(val)
+         elif "min" in key:
+             metrics[key] = np.min(val)
+diff --git a/verl/workers/actor/dp_actor.py b/verl/workers/actor/dp_actor.py
+index d524f0e..48c54ec 100644
+--- a/verl/workers/actor/dp_actor.py
++++ b/verl/workers/actor/dp_actor.py
+@@ -584,6 +584,12 @@ class DataParallelPPOActor(BasePPOActor):
+                     log_prob = outputs["log_probs"]
+                     entropy = outputs["entropys"] if calculate_entropy else None
+ 
++                    if not response_mask.any():
++                        # Padding-only micro-batch: run a zero backward pass to keep all ranks in sync.
++                        dummy_loss = log_prob.sum() * 0.0
++                        (self.scaler.scale(dummy_loss) if self.scaler is not None else dummy_loss).backward()
++                        continue
++
+                     # for fully_async_policy
+                     if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
+                         old_log_prob = model_inputs["old_log_probs"]
